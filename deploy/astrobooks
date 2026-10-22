@@ -24,6 +24,8 @@ Usage: sudo astrobooks COMMAND [options]
   user list
   user add NAME [--admin] [--until YYYY-MM-DD]
   user valid NAME YYYY-MM-DD|none
+  user limit NAME N|default     (downloads per day; default 10)
+  user downloads [NAME]
   user passwd NAME
   user admin NAME on|off
   user delete NAME

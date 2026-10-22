@@ -4,6 +4,8 @@ astro_auth.py - User accounts and login sessions for the Astro Library server.
 
     python astro_auth.py add NAME [--admin] [--until YYYY-MM-DD]   # asks for the password
     python astro_auth.py valid NAME YYYY-MM-DD|none   # last day a reader may use the library
+    python astro_auth.py limit NAME N|default         # downloads a reader may make per day (default 10)
+    python astro_auth.py downloads [NAME]             # the latest downloads, of everyone or of one user
     python astro_auth.py passwd NAME            # change a password (signs the user out everywhere)
     python astro_auth.py admin NAME on|off      # grant / revoke admin rights
     python astro_auth.py delete NAME
@@ -12,6 +14,8 @@ astro_auth.py - User accounts and login sessions for the Astro Library server.
 Accounts live in  $ASTRO_DATA/users.db  (default /var/lib/astrobooks), separate from the library
 so that re-importing the catalogue from the pen drive never touches them.
 Readers whose valid_until date has passed cannot sign in and are signed out; admins never expire.
+Readers may complete DAILY_DOWNLOADS downloads a day unless their account has its own daily_limit;
+admins have no limit. Every download (by anyone) is recorded in the downloads table.
 Passwords are stored as PBKDF2-SHA256 hashes; session cookies are stored only as SHA-256 hashes.
 """
 
@@ -31,14 +35,19 @@ ITERATIONS = 390_000
 SESSION_DAYS = 30
 NAME_RE = re.compile(r"^[A-Za-z0-9._@-]{2,40}$")
 MIN_PASSWORD = 8
+DAILY_DOWNLOADS = 10
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY COLLATE NOCASE, pw_hash TEXT NOT NULL, admin INTEGER NOT NULL DEFAULT 0,
-    created TEXT, last_login TEXT, valid_until TEXT);
+    created TEXT, last_login TEXT, valid_until TEXT, daily_limit INTEGER);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY, user TEXT NOT NULL, csrf TEXT NOT NULL, created REAL, expires REAL, ip TEXT);
+CREATE TABLE IF NOT EXISTS downloads (
+    id INTEGER PRIMARY KEY, user TEXT NOT NULL COLLATE NOCASE, book_id INTEGER, fileid INTEGER, fname TEXT,
+    size INTEGER, at TEXT, day TEXT, ip TEXT, done INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS downloads_user_day ON downloads(user, day);
 """
 
 
@@ -47,8 +56,10 @@ def db():
     con = sqlite3.connect(os.path.join(DATA_DIR, "users.db"), timeout=30)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
-    if "valid_until" not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:     # accounts made before it
-        con.execute("ALTER TABLE users ADD COLUMN valid_until TEXT")
+    cols = {r[1] for r in con.execute("PRAGMA table_info(users)")}      # accounts made before these columns
+    for col, kind in (("valid_until", "TEXT"), ("daily_limit", "INTEGER")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE users ADD COLUMN {col} {kind}")
     return con
 
 
@@ -150,6 +161,22 @@ def set_validity(name, until):
     return None
 
 
+def set_limit(name, limit):
+    """limit: a whole number of downloads per day, or ''/'default' for DAILY_DOWNLOADS."""
+    limit = str(limit if limit is not None else "").strip().lower()
+    if limit in ("", "default"):
+        limit = None
+    elif limit.isdigit() and int(limit) <= 10000:
+        limit = int(limit)
+    else:
+        return "Daily limit: give a number of downloads (0-10000), or leave it empty for the default."
+    con = db()
+    if not con.execute("UPDATE users SET daily_limit=? WHERE name=?", (limit, name)).rowcount:
+        return f"No user '{name}'."
+    con.commit()
+    return None
+
+
 def delete_user(name):
     con = db()
     row = con.execute("SELECT admin FROM users WHERE name=?", (name,)).fetchone()
@@ -164,7 +191,48 @@ def delete_user(name):
 
 
 def list_users():
-    return [dict(r) for r in db().execute("SELECT name, admin, created, last_login, valid_until FROM users ORDER BY name")]
+    today = time.strftime("%Y-%m-%d")
+    return [dict(r) for r in db().execute(
+        "SELECT name, admin, created, last_login, valid_until, daily_limit, "
+        "(SELECT COUNT(*) FROM downloads d WHERE d.user=u.name AND d.day=? AND d.done=1) AS today, "
+        "(SELECT COUNT(*) FROM downloads d WHERE d.user=u.name AND d.done=1) AS total "
+        "FROM users u ORDER BY name", (today,))]
+
+
+# ----------------------------------------------------------------------------- downloads
+def limit_of(row):
+    """Downloads a day the account may complete; None = no limit (admins)."""
+    if row["admin"]:
+        return None
+    return DAILY_DOWNLOADS if row["daily_limit"] is None else row["daily_limit"]
+
+
+def downloads_today(name):
+    return db().execute("SELECT COUNT(*) FROM downloads WHERE user=? AND day=? AND done=1",
+                        (name, time.strftime("%Y-%m-%d"))).fetchone()[0]
+
+
+def download_started(name, book, ip=""):
+    con = db()
+    cur = con.execute("INSERT INTO downloads(user, book_id, fileid, fname, size, at, day, ip) VALUES (?,?,?,?,?,?,?,?)",
+                      (name, book.get("id"), book.get("fileid"), book.get("fname"), book.get("size"), now(),
+                       time.strftime("%Y-%m-%d"), ip))
+    con.commit()
+    return cur.lastrowid
+
+
+def download_finished(rec_id, done):
+    con = db()
+    con.execute("UPDATE downloads SET done=? WHERE id=?", (int(bool(done)), rec_id))
+    con.commit()
+
+
+def download_history(name=None, limit=200):
+    sql = "SELECT user, book_id, fname, size, at, ip, done FROM downloads"
+    args = ()
+    if name:
+        sql, args = sql + " WHERE user=?", (name,)
+    return [dict(r) for r in db().execute(sql + " ORDER BY id DESC LIMIT ?", args + (limit,))]
 
 
 # ----------------------------------------------------------------------------- sessions
@@ -196,7 +264,7 @@ def session(token):
     if not token:
         return None
     con = db()
-    r = con.execute("SELECT s.user, s.csrf, s.expires, u.admin, u.valid_until FROM sessions s JOIN users u ON u.name=s.user "
+    r = con.execute("SELECT s.user, s.csrf, s.expires, u.admin, u.valid_until, u.daily_limit FROM sessions s JOIN users u ON u.name=s.user "
                     "WHERE s.token_hash=?", (_th(token),)).fetchone()
     t = time.time()
     if not r or r["expires"] < t or expired(r):
@@ -204,7 +272,7 @@ def session(token):
     if r["expires"] - t < (SESSION_DAYS - 1) * 86400:
         con.execute("UPDATE sessions SET expires=? WHERE token_hash=?", (t + SESSION_DAYS * 86400, _th(token)))
         con.commit()
-    return {"user": r["user"], "admin": bool(r["admin"]), "csrf": r["csrf"]}
+    return {"user": r["user"], "admin": bool(r["admin"]), "csrf": r["csrf"], "limit": limit_of(r)}
 
 
 def logout(token):
@@ -232,6 +300,8 @@ def main():
     a.add_argument("--until", help="last day a reader may use the library (YYYY-MM-DD)")
     sub.add_parser("passwd").add_argument("name")
     m = sub.add_parser("admin"); m.add_argument("name"); m.add_argument("state", choices=["on", "off"])
+    n = sub.add_parser("limit"); n.add_argument("name"); n.add_argument("count", help="downloads per day, or default")
+    sub.add_parser("downloads").add_argument("name", nargs="?")
     v = sub.add_parser("valid"); v.add_argument("name"); v.add_argument("until", help="YYYY-MM-DD or none")
     sub.add_parser("delete").add_argument("name")
     sub.add_parser("list")
@@ -243,10 +313,19 @@ def main():
         for u in users:
             until = "" if u["admin"] else f"  valid until {u['valid_until'] or 'no limit'}" + \
                 (" (EXPIRED)" if expired(u) else "")
+            lim = limit_of(u)
+            per_day = f"  downloads today {u['today']}/{'no limit' if lim is None else lim}, total {u['total']}"
             print(f"{u['name']:<24} {'admin' if u['admin'] else 'reader':<7} created {u['created'] or '-':<20} "
-                  f"last login {u['last_login'] or 'never'}{until}")
+                  f"last login {u['last_login'] or 'never'}{until}{per_day}")
         if not users:
             print("No users yet.  Add one:  astrobooks user add NAME --admin")
+        return
+    if a.cmd == "downloads":
+        rows = download_history(a.name)
+        for d in reversed(rows):
+            print(f"{d['at']}  {d['user']:<16} {'done' if d['done'] else 'broken off':<10} {d['fname']}")
+        if not rows:
+            print("No downloads recorded.")
         return
     if a.cmd == "count-admins":
         print(db().execute("SELECT COUNT(*) FROM users WHERE admin=1").fetchone()[0])
@@ -258,6 +337,8 @@ def main():
         err = add_user(a.name, ask_password(), a.admin, a.until)
     elif a.cmd == "passwd":
         err = set_password(a.name, ask_password())
+    elif a.cmd == "limit":
+        err = set_limit(a.name, a.count)
     elif a.cmd == "valid":
         err = set_validity(a.name, a.until)
     elif a.cmd == "admin":

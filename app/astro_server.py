@@ -11,8 +11,9 @@ Configuration comes from environment variables (normally /etc/astrobooks/astrobo
   ASTRO_PORT           listen port                                                     (default 8765)
   ASTRO_ALLOWED_HOSTS  comma-separated host names the site answers to   (default astrobooks.munjal.tech,localhost,127.0.0.1)
 
-Everyone must sign in. Readers can search, read books in the browser and download them one at a time;
-their access ends on the account's valid-until date. Admins can also run the pCloud downloader, rebuild the catalogue, export it and
+Everyone must sign in. Readers can search, read books in the browser and download them one at a time, up to
+their daily limit (10 unless the admin sets another); their access ends on the account's valid-until date.
+Every download is recorded per user. Admins can also run the pCloud downloader, rebuild the catalogue, export it and
 manage user accounts.  Accounts are managed with astro_auth.py (or the Users card in Tools).
 
 Uses only the Python standard library (plus the companion scripts in the same folder).
@@ -466,7 +467,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send(page.encode("utf-8"), code, "text/html")
 
     def stream(self, path, name, ctype, kind, cache="private, max-age=3600"):
-        """Sends a file with HTTP Range support (PDF viewers fetch large books piece by piece)."""
+        """Sends a file with HTTP Range support (PDF viewers fetch large books piece by piece).
+        Returns True when everything asked for was sent."""
         size = os.path.getsize(path)
         start, end, code = 0, size - 1, 200
         m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
@@ -480,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                return
+                return False
             code = 206
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -494,7 +496,7 @@ class Handler(BaseHTTPRequestHandler):
         self.common_headers()
         self.end_headers()
         if self.command == "HEAD":
-            return
+            return False
         try:
             with open(path, "rb") as fh:
                 fh.seek(start)
@@ -505,8 +507,10 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     left -= len(chunk)
+            return left == 0
         except (BrokenPipeError, ConnectionResetError, TimeoutError):   # viewer cancelled a range request
             self.close_connection = True
+            return False
 
     def serve_book(self, sess, parts, q):
         try:
@@ -519,15 +523,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.message("This book is not on the server yet.", 404)
         ctype = None if q.get("dl") else INLINE_TYPES.get((b["ext"] or "").lower())
         kind = "inline" if ctype else "attachment"
-        if kind == "inline" or sess["admin"] or self.command == "HEAD":
+        if kind == "inline" or self.command == "HEAD":
             return self.stream(path, b["fname"], ctype or "application/octet-stream", kind)
+        if sess["admin"]:
+            return self.recorded_download(sess, b, path)
         key = sess["user"].lower()
         if not READER_DOWNLOADS.take(key):
             return self.message("You are already downloading a book. Wait until it has finished, then try again.", 429)
         try:
-            self.stream(path, b["fname"], "application/octet-stream", kind)
+            if AUTH.downloads_today(sess["user"]) >= sess["limit"]:
+                return self.message(f"You have used today's {sess['limit']} downloads. You can download again "
+                                    "tomorrow; reading books in the browser still works.", 429)
+            self.recorded_download(sess, b, path)
         finally:
             READER_DOWNLOADS.give(key)
+
+    def recorded_download(self, sess, b, path):
+        """Streams a book as an attachment and records it; only a completed download counts towards the limit."""
+        rec = AUTH.download_started(sess["user"], b, self.client_ip())
+        AUTH.download_finished(rec, self.stream(path, b["fname"], "application/octet-stream", "attachment"))
 
     def serve_zip(self, sess):
         if not sess["admin"]:
@@ -615,7 +629,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/task":
             return self.send(L.task.state())
         if u.path == "/api/users":
-            return self.send({"users": AUTH.list_users()})
+            return self.send({"users": AUTH.list_users(), "default_limit": AUTH.DAILY_DOWNLOADS})
+        if u.path == "/api/downloads":
+            return self.send({"rows": AUTH.download_history((q.get("user") or [""])[0] or None, 500)})
         self.send({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -736,6 +752,10 @@ class Handler(BaseHTTPRequestHandler):
         if act == "add":
             err = AUTH.add_user(name, str(data.get("password") or ""), bool(data.get("admin")),
                                 str(data.get("valid_until") or ""))
+            if not err and str(data.get("daily_limit") or "").strip():
+                err = AUTH.set_limit(name, data.get("daily_limit"))
+        elif act == "limit":
+            err = AUTH.set_limit(name, data.get("daily_limit"))
         elif act == "valid":
             err = AUTH.set_validity(name, str(data.get("valid_until") or ""))
         elif act == "passwd":
@@ -747,7 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             err = "You cannot delete your own account." if name.lower() == me.lower() else AUTH.delete_user(name)
         else:
             err = "unknown action"
-        return {"ok": err is None, "error": err, "users": AUTH.list_users()}
+        return {"ok": err is None, "error": err, "users": AUTH.list_users(), "default_limit": AUTH.DAILY_DOWNLOADS}
 
 
 def esc(s):
@@ -924,12 +944,15 @@ table.fl{border-collapse:collapse;font-size:12px;width:100%}table.fl td{border-b
   <div style="display:flex;align-items:center;gap:12px;margin-top:20px"><h3 style="margin:0">Task output</h3><span id="tk-pill" class="pill idle">Idle</span><button class="b danger" id="tk-stop" style="padding:3px 10px">Stop</button></div>
   <pre class="log" id="tk-log" style="margin-top:8px"></pre>
   <h3>Users</h3>
-  <div class="card"><p class="note" style="margin:0 0 8px">Readers can search, read and download books (one download at a time) until their <i>valid until</i> date; leave it empty for no limit. Admins can also use pCloud sync, Tools and this list.</p>
+  <div class="card"><p class="note" style="margin:0 0 8px">Readers can search, read and download books (one at a time, up to their <i>downloads a day</i> – 10 if left empty) until their <i>valid until</i> date (empty = no end). Click a user name to fill the form, <i>downloads</i> to see what they downloaded. Admins can also use pCloud sync, Tools and this list.</p>
    <table class="fl" id="u-list"></table>
    <div class="uform"><input type="text" id="u-name" placeholder="user name" autocomplete="off" autocapitalize="none"><input type="password" id="u-pw" placeholder="password (8+ characters)" autocomplete="new-password">
     <label class="chk" style="margin:0">valid until <input type="date" id="u-until"></label>
+    <label class="chk" style="margin:0">downloads a day <input type="number" id="u-limit" min="0" max="10000" placeholder="10" style="width:70px"></label>
     <label class="chk" style="margin:0"><input type="checkbox" id="u-admin"> admin</label>
-    <button class="b p" id="u-add">Add user</button><button class="b" id="u-pass" title="Set a new password for the user name typed here">Set password</button><button class="b" id="u-valid" title="Set the valid-until date for the user name typed here (empty date = no limit)">Set validity</button></div></div>
+    <button class="b p" id="u-add">Add user</button><button class="b" id="u-pass" title="Set a new password for the user name typed here">Set password</button><button class="b" id="u-valid" title="Set the valid-until date for the user name typed here (empty date = no limit)">Set validity</button><button class="b" id="u-lim" title="Set the downloads a day for the user name typed here (empty = default)">Set limit</button></div>
+   <div id="u-hist" style="display:none;margin-top:14px"><div style="display:flex;align-items:center;gap:10px"><b id="u-hist-t"></b><a class="lnk" id="u-hist-x">close</a></div>
+    <div style="max-height:360px;overflow:auto;margin-top:6px"><table class="fl" id="u-hist-l"></table></div></div></div>
  </div></section>
 </main>
 <div class="modal" id="pw-box"><div class="card"><b>Change your password</b>
@@ -1068,14 +1091,22 @@ async function pollTask(){if(!ADMIN)return false;const s=await api('/api/task');
  if(taskWasRunning&&!s.running){if(await loadFacets())go()}taskWasRunning=s.running;return s.running}
 const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
 const validity=u=>u.admin?'—':!u.valid_until?'no limit':u.valid_until<today()?'<span style="color:var(--bad)">expired '+esc(u.valid_until)+'</span>':esc(u.valid_until);
-function showUsers(us){$('u-list').innerHTML='<tr><td><b>User</b></td><td><b>Role</b></td><td><b>Valid until</b></td><td><b>Last sign-in</b></td><td></td></tr>'+us.map(u=>'<tr><td><a class="lnk" data-pick="'+esc(u.name)+'" data-until="'+esc(u.valid_until||'')+'" title="Fill the form with this user">'+esc(u.name)+'</a></td><td>'+(u.admin?'admin':'reader')+'</td><td>'+validity(u)+'</td><td>'+esc(u.last_login||'never')+'</td><td style="text-align:right">'+
+let defLimit=10;
+const perDay=u=>u.today+' / '+(u.admin?'no limit':(u.daily_limit==null?defLimit:u.daily_limit));
+function showUsers(us){$('u-list').innerHTML='<tr><td><b>User</b></td><td><b>Role</b></td><td><b>Valid until</b></td><td><b>Downloads today</b></td><td><b>Last sign-in</b></td><td></td></tr>'+us.map(u=>'<tr><td><a class="lnk" data-pick="'+esc(u.name)+'" data-until="'+esc(u.valid_until||'')+'" data-limit="'+(u.daily_limit==null?'':u.daily_limit)+'" title="Fill the form with this user">'+esc(u.name)+'</a></td><td>'+(u.admin?'admin':'reader')+'</td><td>'+validity(u)+'</td><td>'+perDay(u)+' · <a class="lnk" data-hist="'+esc(u.name)+'" title="Books this user downloaded">downloads ('+u.total+')</a></td><td>'+esc(u.last_login||'never')+'</td><td style="text-align:right">'+
   (u.name.toLowerCase()===USER.toLowerCase()?'<i style="color:var(--mute)">you</i>':'<a class="lnk" data-u="'+esc(u.name)+'" data-act="admin" data-admin="'+(u.admin?0:1)+'">'+(u.admin?'make reader':'make admin')+'</a> · <a class="lnk" data-u="'+esc(u.name)+'" data-act="delete" style="color:var(--bad)">delete</a>')+'</td></tr>').join('')}
-async function loadUsers(){if(!ADMIN)return;const r=await api('/api/users');showUsers(r.users||[])}
+async function loadUsers(){if(!ADMIN)return;const r=await api('/api/users');defLimit=r.default_limit||10;showUsers(r.users||[])}
 async function userAct(body){const r=await api('/api/users',body);if(!r.ok)return toast(r.error);showUsers(r.users);toast('Done');return true}
-$('u-list').onclick=e=>{const p=e.target.closest('[data-pick]');if(p){$('u-name').value=p.dataset.pick;$('u-until').value=p.dataset.until;return}
+async function showHist(name){const r=await api('/api/downloads?user='+encodeURIComponent(name)),rows=r.rows||[];
+ $('u-hist-t').textContent='Downloads by '+name+' ('+rows.length+(rows.length>=500?', latest':'')+')';$('u-hist').style.display='block';
+ $('u-hist-l').innerHTML='<tr><td><b>When</b></td><td><b>Book</b></td><td><b>Size</b></td><td><b>Result</b></td><td><b>From</b></td></tr>'+(rows.map(d=>'<tr><td style="white-space:nowrap">'+esc(d.at)+'</td><td>'+esc(d.fname||'#'+d.book_id)+'</td><td style="white-space:nowrap">'+(d.size?human(d.size):'')+'</td><td>'+(d.done?'done':'<span style="color:var(--mute)">broken off</span>')+'</td><td>'+esc(d.ip||'')+'</td></tr>').join('')||'<tr><td colspan="5"><i>No downloads yet.</i></td></tr>')}
+$('u-hist-x').onclick=()=>$('u-hist').style.display='none';
+$('u-list').onclick=e=>{const h=e.target.closest('[data-hist]');if(h)return showHist(h.dataset.hist);
+ const p=e.target.closest('[data-pick]');if(p){$('u-name').value=p.dataset.pick;$('u-until').value=p.dataset.until;$('u-limit').value=p.dataset.limit;return}
  const a=e.target.closest('[data-act]');if(!a)return;
  if(a.dataset.act==='delete'&&!confirmBox('Delete user '+a.dataset.u+'?'))return;userAct({action:a.dataset.act,name:a.dataset.u,admin:a.dataset.admin==='1'})};
-$('u-add').onclick=async()=>{if(await userAct({action:'add',name:$('u-name').value.trim(),password:$('u-pw').value,admin:$('u-admin').checked,valid_until:$('u-until').value})){$('u-name').value=$('u-pw').value=$('u-until').value=''}};
+$('u-add').onclick=async()=>{if(await userAct({action:'add',name:$('u-name').value.trim(),password:$('u-pw').value,admin:$('u-admin').checked,valid_until:$('u-until').value,daily_limit:$('u-limit').value})){$('u-name').value=$('u-pw').value=$('u-until').value=$('u-limit').value=''}};
+$('u-lim').onclick=()=>userAct({action:'limit',name:$('u-name').value.trim(),daily_limit:$('u-limit').value});
 $('u-valid').onclick=()=>userAct({action:'valid',name:$('u-name').value.trim(),valid_until:$('u-until').value});
 $('u-pass').onclick=async()=>{if(await userAct({action:'passwd',name:$('u-name').value.trim(),password:$('u-pw').value}))$('u-pw').value=''};
 
