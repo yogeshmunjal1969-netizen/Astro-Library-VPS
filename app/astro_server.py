@@ -951,6 +951,7 @@ table.fl{border-collapse:collapse;font-size:12px;width:100%}table.fl td{border-b
     <label class="chk" style="margin:0">downloads a day <input type="number" id="u-limit" min="0" max="10000" placeholder="10" style="width:70px"></label>
     <label class="chk" style="margin:0"><input type="checkbox" id="u-admin"> admin</label>
     <button class="b p" id="u-add">Add user</button><button class="b" id="u-pass" title="Set a new password for the user name typed here">Set password</button><button class="b" id="u-valid" title="Set the valid-until date for the user name typed here (empty date = no limit)">Set validity</button><button class="b" id="u-lim" title="Set the downloads a day for the user name typed here (empty = default)">Set limit</button></div>
+   <div id="u-err" role="alert" style="display:none;margin-top:8px;padding:7px 10px;border-radius:6px;border:1px solid var(--bad);color:var(--bad);font-size:13px"></div>
    <div id="u-hist" style="display:none;margin-top:14px"><div style="display:flex;align-items:center;gap:10px"><b id="u-hist-t"></b><a class="lnk" id="u-hist-x">close</a></div>
     <div style="max-height:360px;overflow:auto;margin-top:6px"><table class="fl" id="u-hist-l"></table></div></div></div>
  </div></section>
@@ -1096,7 +1097,9 @@ const perDay=u=>u.today+' / '+(u.admin?'no limit':(u.daily_limit==null?defLimit:
 function showUsers(us){$('u-list').innerHTML='<tr><td><b>User</b></td><td><b>Role</b></td><td><b>Valid until</b></td><td><b>Downloads today</b></td><td><b>Last sign-in</b></td><td></td></tr>'+us.map(u=>'<tr><td><a class="lnk" data-pick="'+esc(u.name)+'" data-until="'+esc(u.valid_until||'')+'" data-limit="'+(u.daily_limit==null?'':u.daily_limit)+'" title="Fill the form with this user">'+esc(u.name)+'</a></td><td>'+(u.admin?'admin':'reader')+'</td><td>'+validity(u)+'</td><td>'+perDay(u)+' · <a class="lnk" data-hist="'+esc(u.name)+'" title="Books this user downloaded">downloads ('+u.total+')</a></td><td>'+esc(u.last_login||'never')+'</td><td style="text-align:right">'+
   (u.name.toLowerCase()===USER.toLowerCase()?'<i style="color:var(--mute)">you</i>':'<a class="lnk" data-u="'+esc(u.name)+'" data-act="admin" data-admin="'+(u.admin?0:1)+'">'+(u.admin?'make reader':'make admin')+'</a> · <a class="lnk" data-u="'+esc(u.name)+'" data-act="delete" style="color:var(--bad)">delete</a>')+'</td></tr>').join('')}
 async function loadUsers(){if(!ADMIN)return;const r=await api('/api/users');defLimit=r.default_limit||10;showUsers(r.users||[])}
-async function userAct(body){const r=await api('/api/users',body);if(!r.ok)return toast(r.error);showUsers(r.users);toast('Done');return true}
+function userErr(m){const e=$('u-err');e.textContent=m||'';e.style.display=m?'block':'none'}
+async function userAct(body){const r=await api('/api/users',body);if(!r.ok){userErr(r.error);return false}userErr('');showUsers(r.users);toast('Done');return true}
+['u-name','u-pw','u-until','u-limit'].forEach(id=>$(id).addEventListener('input',()=>userErr('')));
 async function showHist(name){const r=await api('/api/downloads?user='+encodeURIComponent(name)),rows=r.rows||[];
  $('u-hist-t').textContent='Downloads by '+name+' ('+rows.length+(rows.length>=500?', latest':'')+')';$('u-hist').style.display='block';
  $('u-hist-l').innerHTML='<tr><td><b>When</b></td><td><b>Book</b></td><td><b>Size</b></td><td><b>Result</b></td><td><b>From</b></td></tr>'+(rows.map(d=>'<tr><td style="white-space:nowrap">'+esc(d.at)+'</td><td>'+esc(d.fname||'#'+d.book_id)+'</td><td style="white-space:nowrap">'+(d.size?human(d.size):'')+'</td><td>'+(d.done?'done':'<span style="color:var(--mute)">broken off</span>')+'</td><td>'+esc(d.ip||'')+'</td></tr>').join('')||'<tr><td colspan="5"><i>No downloads yet.</i></td></tr>')}
