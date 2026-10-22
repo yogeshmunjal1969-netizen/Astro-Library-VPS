@@ -1,0 +1,2 @@
+# shell scripts and service files must keep Unix line endings even when committed from Windows
+* text=auto eol=lf

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# astrobooks - manage the Astro Library server.  Run "sudo astrobooks help" for the list of commands.
+set -euo pipefail
+
+APP_DIR=/opt/astrobooks
+ENV_FILE=/etc/astrobooks/astrobooks.env
+SVC_USER=astrobooks
+PY=$APP_DIR/venv/bin/python
+
+usage() {
+    cat <<'EOF'
+Usage: sudo astrobooks COMMAND [options]
+
+  status                 service, tunnel and disk overview
+  logs                   follow the server log (Ctrl+C to leave)
+  start | stop | restart the web server
+
+  import-usb [/dev/sdX1] copy the library from the pen drive plugged into this server
+                         (options: --dry-run, --no-db, --src-dir FOLDER; see --help)
+  build [--no-pdf-meta]  rebuild the catalogue after adding books
+  sync [options]         fetch new / missing books from pCloud (same as Tools -> pCloud sync)
+  check                  database check, and mark books present / missing from what is on disk
+
+  user list
+  user add NAME [--admin]
+  user passwd NAME
+  user admin NAME on|off
+  user delete NAME
+
+  tunnel TOKEN           connect (or re-connect) the Cloudflare Tunnel with a token from the dashboard
+  update                 pull the latest version from GitHub and reinstall
+EOF
+}
+
+die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+cmd="${1:-help}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in help|-h|--help) usage; exit 0 ;; esac
+[[ $EUID -eq 0 ]] || die "run with sudo:  sudo astrobooks $cmd $*"
+[[ -f $ENV_FILE ]] || die "$ENV_FILE not found - run deploy/install.sh first"
+set -a; . "$ENV_FILE"; set +a
+
+as_svc() { (cd "$APP_DIR/app" && runuser -u "$SVC_USER" -- env ASTRO_LIB="$ASTRO_LIB" ASTRO_DATA="$ASTRO_DATA" PYTHONIOENCODING=utf-8 "$@"); }
+
+case "$cmd" in
+    status)
+        systemctl --no-pager status astrobooks | head -n 12 || true
+        echo
+        if [[ -f /etc/systemd/system/cloudflared.service ]]; then
+            systemctl --no-pager status cloudflared | head -n 5 || true
+        else
+            echo "Cloudflare Tunnel: not set up (sudo astrobooks tunnel TOKEN)"
+        fi
+        echo
+        df -h "$ASTRO_LIB"
+        echo
+        if [[ -f $ASTRO_LIB/_library/library.db ]]; then
+            as_svc "$PY" "$APP_DIR/app/astro_maint.py" --lib "$ASTRO_LIB" check || true
+        else
+            echo "No library data yet - plug in the pen drive and run:  sudo astrobooks import-usb"
+        fi
+        as_svc "$PY" "$APP_DIR/app/astro_auth.py" list
+        ;;
+    logs)
+        exec journalctl -u astrobooks -f -n 100
+        ;;
+    start|stop|restart)
+        systemctl "$cmd" astrobooks
+        ;;
+    import-usb)
+        exec "$APP_DIR/import-usb.sh" "$@"
+        ;;
+    build)
+        as_svc "$PY" "$APP_DIR/app/astro_library.py" --lib "$ASTRO_LIB" build "$@"
+        ;;
+    sync)
+        as_svc "$PY" "$APP_DIR/app/astro_downloader.py" --dest "$ASTRO_LIB" "$@"
+        as_svc "$PY" "$APP_DIR/app/astro_library.py" --lib "$ASTRO_LIB" build
+        ;;
+    check)
+        as_svc "$PY" "$APP_DIR/app/astro_maint.py" --lib "$ASTRO_LIB" check
+        as_svc "$PY" "$APP_DIR/app/astro_maint.py" --lib "$ASTRO_LIB" reconcile
+        ;;
+    user|users)
+        [[ $# -gt 0 ]] || set -- list
+        as_svc "$PY" "$APP_DIR/app/astro_auth.py" "$@"
+        ;;
+    tunnel)
+        token="${1:-}"
+        [[ -n $token ]] || die "give the token:  sudo astrobooks tunnel eyJh...   (Cloudflare dashboard -> Networks -> Tunnels)"
+        command -v cloudflared >/dev/null || die "cloudflared is not installed - re-run deploy/install.sh"
+        if [[ -f /etc/systemd/system/cloudflared.service ]]; then
+            cloudflared service uninstall >/dev/null 2>&1 || true
+        fi
+        cloudflared service install "$token"
+        systemctl enable --now cloudflared >/dev/null 2>&1 || true
+        sleep 3
+        systemctl is-active --quiet cloudflared && echo "Tunnel connected. Open https://astrobooks.munjal.tech" \
+            || die "cloudflared did not start - see:  journalctl -u cloudflared -n 50"
+        ;;
+    update)
+        repo="$(cat "$APP_DIR/repo-path" 2>/dev/null || true)"
+        [[ -d $repo/.git ]] || die "the git checkout ($repo) is gone - clone the repository again and run deploy/install.sh"
+        owner="$(stat -c %U "$repo")"
+        runuser -u "$owner" -- git -C "$repo" pull --ff-only
+        exec "$repo/deploy/install.sh" --yes
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac

@@ -1,0 +1,24 @@
+[Unit]
+Description=Astro Library web server (astrobooks.munjal.tech)
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astrobooks
+Group=astrobooks
+EnvironmentFile=/etc/astrobooks/astrobooks.env
+WorkingDirectory=/opt/astrobooks/app
+ExecStart=/opt/astrobooks/venv/bin/python -u /opt/astrobooks/app/astro_server.py
+Restart=on-failure
+RestartSec=5
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
