@@ -22,7 +22,8 @@ Usage: sudo astrobooks COMMAND [options]
   check                  database check, and mark books present / missing from what is on disk
 
   user list
-  user add NAME [--admin]
+  user add NAME [--admin] [--until YYYY-MM-DD]
+  user valid NAME YYYY-MM-DD|none
   user passwd NAME
   user admin NAME on|off
   user delete NAME

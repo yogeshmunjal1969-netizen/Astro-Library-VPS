@@ -11,8 +11,8 @@ Configuration comes from environment variables (normally /etc/astrobooks/astrobo
   ASTRO_PORT           listen port                                                     (default 8765)
   ASTRO_ALLOWED_HOSTS  comma-separated host names the site answers to   (default astrobooks.munjal.tech,localhost,127.0.0.1)
 
-Everyone must sign in. Readers can search, read books in the browser, download them and download their
-shortlist as a ZIP. Admins can also run the pCloud downloader, rebuild the catalogue, export it and
+Everyone must sign in. Readers can search, read books in the browser and download them one at a time;
+their access ends on the account's valid-until date. Admins can also run the pCloud downloader, rebuild the catalogue, export it and
 manage user accounts.  Accounts are managed with astro_auth.py (or the Users card in Tools).
 
 Uses only the Python standard library (plus the companion scripts in the same folder).
@@ -144,6 +144,28 @@ class Throttle:
 
 
 IP_THROTTLE, USER_THROTTLE = Throttle(10), Throttle(20)
+
+
+class OneAtATime:
+    """Gives each reader one download slot; it frees when the transfer finishes or breaks off."""
+
+    def __init__(self):
+        self.busy = set()
+        self.lock = threading.Lock()
+
+    def take(self, key):
+        with self.lock:
+            if key in self.busy:
+                return False
+            self.busy.add(key)
+            return True
+
+    def give(self, key):
+        with self.lock:
+            self.busy.discard(key)
+
+
+READER_DOWNLOADS = OneAtATime()
 
 
 # ----------------------------------------------------------------------------- data access
@@ -361,6 +383,7 @@ class Handler(BaseHTTPRequestHandler):
     L: Library = None
     protocol_version = "HTTP/1.1"
     server_version = "AstroLibrary"
+    timeout = 120                       # a stalled client must not hold a reader's download slot for ever
     sys_version = ""
 
     def log_message(self, fmt, *a):
@@ -482,7 +505,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     left -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):        # viewer cancelled a range request
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):   # viewer cancelled a range request
             self.close_connection = True
 
     def serve_book(self, sess, parts, q):
@@ -495,9 +518,20 @@ class Handler(BaseHTTPRequestHandler):
         if not b or not path or not os.path.isfile(path):
             return self.message("This book is not on the server yet.", 404)
         ctype = None if q.get("dl") else INLINE_TYPES.get((b["ext"] or "").lower())
-        self.stream(path, b["fname"], ctype or "application/octet-stream", "inline" if ctype else "attachment")
+        kind = "inline" if ctype else "attachment"
+        if kind == "inline" or sess["admin"] or self.command == "HEAD":
+            return self.stream(path, b["fname"], ctype or "application/octet-stream", kind)
+        key = sess["user"].lower()
+        if not READER_DOWNLOADS.take(key):
+            return self.message("You are already downloading a book. Wait until it has finished, then try again.", 429)
+        try:
+            self.stream(path, b["fname"], "application/octet-stream", kind)
+        finally:
+            READER_DOWNLOADS.give(key)
 
     def serve_zip(self, sess):
+        if not sess["admin"]:
+            return self.message("Readers download books one at a time.", 403)
         files = self.L.shortlist_files(sess["user"])
         if not files:
             return self.message("None of your shortlisted books are on the server.", 404)
@@ -679,14 +713,19 @@ class Handler(BaseHTTPRequestHandler):
             err = "Too many failed attempts. Wait 15 minutes and try again."
         else:
             token, row = AUTH.login(name, pw, ip)
-            if token:
+            if row and not token:
+                IP_THROTTLE.reset(ip)
+                USER_THROTTLE.reset(name.lower())
+                err = f"Your access ended on {row['valid_until']}. Please contact the library admin."
+            elif token:
                 IP_THROTTLE.reset(ip)
                 USER_THROTTLE.reset(name.lower())
                 return self.redirect("/", [("Set-Cookie", self.cookie(token, AUTH.SESSION_DAYS * 86400))])
-            IP_THROTTLE.fail(ip)
-            USER_THROTTLE.fail(name.lower())
-            sys.stderr.write(f"failed sign-in for {name!r} from {ip}\n")
-            err = "Wrong user name or password."
+            else:
+                IP_THROTTLE.fail(ip)
+                USER_THROTTLE.fail(name.lower())
+                sys.stderr.write(f"failed sign-in for {name!r} from {ip}\n")
+                err = "Wrong user name or password."
         body = LOGIN_FORM.replace("__ERR__", f'<div class="err">{esc(err)}</div>').replace(
             'name="user" ', f'name="user" value="{esc(name)}" ')
         self.send(LOGIN_PAGE.replace("__BODY__", body).encode("utf-8"), 401, "text/html")
@@ -695,7 +734,10 @@ class Handler(BaseHTTPRequestHandler):
     def users_action(me, data):
         act, name = data.get("action"), str(data.get("name") or "").strip()
         if act == "add":
-            err = AUTH.add_user(name, str(data.get("password") or ""), bool(data.get("admin")))
+            err = AUTH.add_user(name, str(data.get("password") or ""), bool(data.get("admin")),
+                                str(data.get("valid_until") or ""))
+        elif act == "valid":
+            err = AUTH.set_validity(name, str(data.get("valid_until") or ""))
         elif act == "passwd":
             err = AUTH.set_password(name, str(data.get("password") or ""))
         elif act == "admin":
@@ -840,7 +882,7 @@ table.fl{border-collapse:collapse;font-size:12px;width:100%}table.fl td{border-b
     <button class="b" id="ftog">Filters</button>
     <select id="sort"><option value="title">Sort: Title</option><option value="author">Sort: Author</option><option value="year">Sort: Year ↑</option><option value="year_desc">Sort: Year ↓</option><option value="pages">Sort: Pages</option><option value="size">Sort: Size</option><option value="added">Sort: Recently added</option></select></div>
    <div class="sbar"><span>★ Shortlist: <b id="sl-count">0</b> book(s)<span id="sl-pend"></span></span>
-    <button class="b" id="sl-view">View</button><a class="b p" id="sl-zip" href="/zip/shortlist" title="Download the shortlisted books as one ZIP file">Download ZIP</a>
+    <button class="b" id="sl-view">View</button><a class="b p adm" id="sl-zip" href="/zip/shortlist" title="Download the shortlisted books as one ZIP file">Download ZIP</a>
     <button class="b adm" id="sl-dl" title="Fetch the shortlisted books that are not on the server yet from pCloud">Fetch from pCloud</button>
     <span class="sp"></span><button class="b danger" id="sl-clear">Clear</button></div>
    <div class="meta"><span id="count"></span><a class="lnk" id="sl-addall" style="display:none">☆ Add all results to shortlist</a></div>
@@ -882,11 +924,12 @@ table.fl{border-collapse:collapse;font-size:12px;width:100%}table.fl td{border-b
   <div style="display:flex;align-items:center;gap:12px;margin-top:20px"><h3 style="margin:0">Task output</h3><span id="tk-pill" class="pill idle">Idle</span><button class="b danger" id="tk-stop" style="padding:3px 10px">Stop</button></div>
   <pre class="log" id="tk-log" style="margin-top:8px"></pre>
   <h3>Users</h3>
-  <div class="card"><p class="note" style="margin:0 0 8px">Readers can search, read and download books. Admins can also use pCloud sync, Tools and this list.</p>
+  <div class="card"><p class="note" style="margin:0 0 8px">Readers can search, read and download books (one download at a time) until their <i>valid until</i> date; leave it empty for no limit. Admins can also use pCloud sync, Tools and this list.</p>
    <table class="fl" id="u-list"></table>
    <div class="uform"><input type="text" id="u-name" placeholder="user name" autocomplete="off" autocapitalize="none"><input type="password" id="u-pw" placeholder="password (8+ characters)" autocomplete="new-password">
+    <label class="chk" style="margin:0">valid until <input type="date" id="u-until"></label>
     <label class="chk" style="margin:0"><input type="checkbox" id="u-admin"> admin</label>
-    <button class="b p" id="u-add">Add user</button><button class="b" id="u-pass" title="Set a new password for the user name typed here">Set password</button></div></div>
+    <button class="b p" id="u-add">Add user</button><button class="b" id="u-pass" title="Set a new password for the user name typed here">Set password</button><button class="b" id="u-valid" title="Set the valid-until date for the user name typed here (empty date = no limit)">Set validity</button></div></div>
  </div></section>
 </main>
 <div class="modal" id="pw-box"><div class="card"><b>Change your password</b>
@@ -1023,13 +1066,17 @@ async function pollTask(){if(!ADMIN)return false;const s=await api('/api/task');
  $('tk-stop').disabled=!s.running;document.querySelectorAll('[data-task]').forEach(b=>b.disabled=s.running);
  const lg=$('tk-log');lg.textContent=(s.log||[]).join('\n')||'No task run since the server started.';lg.scrollTop=lg.scrollHeight;
  if(taskWasRunning&&!s.running){if(await loadFacets())go()}taskWasRunning=s.running;return s.running}
-function showUsers(us){$('u-list').innerHTML='<tr><td><b>User</b></td><td><b>Role</b></td><td><b>Last sign-in</b></td><td></td></tr>'+us.map(u=>'<tr><td>'+esc(u.name)+'</td><td>'+(u.admin?'admin':'reader')+'</td><td>'+esc(u.last_login||'never')+'</td><td style="text-align:right">'+
+const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
+const validity=u=>u.admin?'—':!u.valid_until?'no limit':u.valid_until<today()?'<span style="color:var(--bad)">expired '+esc(u.valid_until)+'</span>':esc(u.valid_until);
+function showUsers(us){$('u-list').innerHTML='<tr><td><b>User</b></td><td><b>Role</b></td><td><b>Valid until</b></td><td><b>Last sign-in</b></td><td></td></tr>'+us.map(u=>'<tr><td><a class="lnk" data-pick="'+esc(u.name)+'" data-until="'+esc(u.valid_until||'')+'" title="Fill the form with this user">'+esc(u.name)+'</a></td><td>'+(u.admin?'admin':'reader')+'</td><td>'+validity(u)+'</td><td>'+esc(u.last_login||'never')+'</td><td style="text-align:right">'+
   (u.name.toLowerCase()===USER.toLowerCase()?'<i style="color:var(--mute)">you</i>':'<a class="lnk" data-u="'+esc(u.name)+'" data-act="admin" data-admin="'+(u.admin?0:1)+'">'+(u.admin?'make reader':'make admin')+'</a> · <a class="lnk" data-u="'+esc(u.name)+'" data-act="delete" style="color:var(--bad)">delete</a>')+'</td></tr>').join('')}
 async function loadUsers(){if(!ADMIN)return;const r=await api('/api/users');showUsers(r.users||[])}
 async function userAct(body){const r=await api('/api/users',body);if(!r.ok)return toast(r.error);showUsers(r.users);toast('Done');return true}
-$('u-list').onclick=e=>{const a=e.target.closest('[data-act]');if(!a)return;
+$('u-list').onclick=e=>{const p=e.target.closest('[data-pick]');if(p){$('u-name').value=p.dataset.pick;$('u-until').value=p.dataset.until;return}
+ const a=e.target.closest('[data-act]');if(!a)return;
  if(a.dataset.act==='delete'&&!confirmBox('Delete user '+a.dataset.u+'?'))return;userAct({action:a.dataset.act,name:a.dataset.u,admin:a.dataset.admin==='1'})};
-$('u-add').onclick=async()=>{if(await userAct({action:'add',name:$('u-name').value.trim(),password:$('u-pw').value,admin:$('u-admin').checked})){$('u-name').value=$('u-pw').value=''}};
+$('u-add').onclick=async()=>{if(await userAct({action:'add',name:$('u-name').value.trim(),password:$('u-pw').value,admin:$('u-admin').checked,valid_until:$('u-until').value})){$('u-name').value=$('u-pw').value=$('u-until').value=''}};
+$('u-valid').onclick=()=>userAct({action:'valid',name:$('u-name').value.trim(),valid_until:$('u-until').value});
 $('u-pass').onclick=async()=>{if(await userAct({action:'passwd',name:$('u-name').value.trim(),password:$('u-pw').value}))$('u-pw').value=''};
 
 async function poll(){clearTimeout(poll.h);let busy=false;

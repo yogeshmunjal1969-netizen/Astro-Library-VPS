@@ -2,7 +2,8 @@
 """
 astro_auth.py - User accounts and login sessions for the Astro Library server.
 
-    python astro_auth.py add NAME [--admin]     # asks for the password
+    python astro_auth.py add NAME [--admin] [--until YYYY-MM-DD]   # asks for the password
+    python astro_auth.py valid NAME YYYY-MM-DD|none   # last day a reader may use the library
     python astro_auth.py passwd NAME            # change a password (signs the user out everywhere)
     python astro_auth.py admin NAME on|off      # grant / revoke admin rights
     python astro_auth.py delete NAME
@@ -10,6 +11,7 @@ astro_auth.py - User accounts and login sessions for the Astro Library server.
 
 Accounts live in  $ASTRO_DATA/users.db  (default /var/lib/astrobooks), separate from the library
 so that re-importing the catalogue from the pen drive never touches them.
+Readers whose valid_until date has passed cannot sign in and are signed out; admins never expire.
 Passwords are stored as PBKDF2-SHA256 hashes; session cookies are stored only as SHA-256 hashes.
 """
 
@@ -29,11 +31,12 @@ ITERATIONS = 390_000
 SESSION_DAYS = 30
 NAME_RE = re.compile(r"^[A-Za-z0-9._@-]{2,40}$")
 MIN_PASSWORD = 8
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY COLLATE NOCASE, pw_hash TEXT NOT NULL, admin INTEGER NOT NULL DEFAULT 0,
-    created TEXT, last_login TEXT);
+    created TEXT, last_login TEXT, valid_until TEXT);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY, user TEXT NOT NULL, csrf TEXT NOT NULL, created REAL, expires REAL, ip TEXT);
 """
@@ -44,11 +47,32 @@ def db():
     con = sqlite3.connect(os.path.join(DATA_DIR, "users.db"), timeout=30)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    if "valid_until" not in {r[1] for r in con.execute("PRAGMA table_info(users)")}:     # accounts made before it
+        con.execute("ALTER TABLE users ADD COLUMN valid_until TEXT")
     return con
 
 
 def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def expired(row):
+    """True for a reader whose last valid day is before today."""
+    return not row["admin"] and bool(row["valid_until"]) and row["valid_until"] < time.strftime("%Y-%m-%d")
+
+
+def check_date(until):
+    """(date or None, error): '' / 'none' means no limit."""
+    until = (until or "").strip()
+    if until.lower() in ("", "none"):
+        return None, None
+    try:
+        if DATE_RE.match(until):
+            time.strptime(until, "%Y-%m-%d")
+            return until, None
+    except ValueError:
+        pass
+    return None, "Valid until: give a date as YYYY-MM-DD."
 
 
 # ----------------------------------------------------------------------------- passwords
@@ -79,15 +103,16 @@ def validate(name, pw=None):
 
 
 # ----------------------------------------------------------------------------- users
-def add_user(name, pw, admin=False):
-    err = validate(name, pw)
+def add_user(name, pw, admin=False, until=None):
+    until, err = check_date(until)
+    err = validate(name, pw) or err
     if err:
         return err
     con = db()
     if con.execute("SELECT 1 FROM users WHERE name=?", (name,)).fetchone():
         return f"User '{name}' already exists."
-    con.execute("INSERT INTO users(name, pw_hash, admin, created) VALUES (?,?,?,?)",
-                (name, hash_password(pw), int(bool(admin)), now()))
+    con.execute("INSERT INTO users(name, pw_hash, admin, created, valid_until) VALUES (?,?,?,?,?)",
+                (name, hash_password(pw), int(bool(admin)), now(), until))
     con.commit()
     return None
 
@@ -114,6 +139,17 @@ def set_admin(name, admin):
     return None
 
 
+def set_validity(name, until):
+    until, err = check_date(until)
+    if err:
+        return err
+    con = db()
+    if not con.execute("UPDATE users SET valid_until=? WHERE name=?", (until, name)).rowcount:
+        return f"No user '{name}'."
+    con.commit()
+    return None
+
+
 def delete_user(name):
     con = db()
     row = con.execute("SELECT admin FROM users WHERE name=?", (name,)).fetchone()
@@ -128,7 +164,7 @@ def delete_user(name):
 
 
 def list_users():
-    return [dict(r) for r in db().execute("SELECT name, admin, created, last_login FROM users ORDER BY name")]
+    return [dict(r) for r in db().execute("SELECT name, admin, created, last_login, valid_until FROM users ORDER BY name")]
 
 
 # ----------------------------------------------------------------------------- sessions
@@ -137,11 +173,14 @@ def _th(token):
 
 
 def login(name, pw, ip=""):
-    """Returns (session token, user row) or (None, None)."""
+    """Returns (session token, user row); (None, row) if the password is right but the access has expired;
+    (None, None) for a wrong user name or password."""
     con = db()
     row = con.execute("SELECT * FROM users WHERE name=?", (name or "",)).fetchone()
     if not check_password(pw or "", row["pw_hash"] if row else _DUMMY) or not row:
         return None, None
+    if expired(row):
+        return None, dict(row)
     token = secrets.token_urlsafe(32)
     t = time.time()
     con.execute("DELETE FROM sessions WHERE expires < ?", (t,))
@@ -157,10 +196,10 @@ def session(token):
     if not token:
         return None
     con = db()
-    r = con.execute("SELECT s.user, s.csrf, s.expires, u.admin FROM sessions s JOIN users u ON u.name=s.user "
+    r = con.execute("SELECT s.user, s.csrf, s.expires, u.admin, u.valid_until FROM sessions s JOIN users u ON u.name=s.user "
                     "WHERE s.token_hash=?", (_th(token),)).fetchone()
     t = time.time()
-    if not r or r["expires"] < t:
+    if not r or r["expires"] < t or expired(r):
         return None
     if r["expires"] - t < (SESSION_DAYS - 1) * 86400:
         con.execute("UPDATE sessions SET expires=? WHERE token_hash=?", (t + SESSION_DAYS * 86400, _th(token)))
@@ -190,8 +229,10 @@ def main():
     ap = argparse.ArgumentParser(description="Manage Astro Library user accounts.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add"); a.add_argument("name"); a.add_argument("--admin", action="store_true")
+    a.add_argument("--until", help="last day a reader may use the library (YYYY-MM-DD)")
     sub.add_parser("passwd").add_argument("name")
     m = sub.add_parser("admin"); m.add_argument("name"); m.add_argument("state", choices=["on", "off"])
+    v = sub.add_parser("valid"); v.add_argument("name"); v.add_argument("until", help="YYYY-MM-DD or none")
     sub.add_parser("delete").add_argument("name")
     sub.add_parser("list")
     sub.add_parser("count-admins")
@@ -200,8 +241,10 @@ def main():
     if a.cmd == "list":
         users = list_users()
         for u in users:
+            until = "" if u["admin"] else f"  valid until {u['valid_until'] or 'no limit'}" + \
+                (" (EXPIRED)" if expired(u) else "")
             print(f"{u['name']:<24} {'admin' if u['admin'] else 'reader':<7} created {u['created'] or '-':<20} "
-                  f"last login {u['last_login'] or 'never'}")
+                  f"last login {u['last_login'] or 'never'}{until}")
         if not users:
             print("No users yet.  Add one:  astrobooks user add NAME --admin")
         return
@@ -209,11 +252,14 @@ def main():
         print(db().execute("SELECT COUNT(*) FROM users WHERE admin=1").fetchone()[0])
         return
     if a.cmd == "add":
-        if validate(a.name):
-            sys.exit(validate(a.name))
-        err = add_user(a.name, ask_password(), a.admin)
+        err = validate(a.name) or check_date(a.until)[1]
+        if err:
+            sys.exit(err)
+        err = add_user(a.name, ask_password(), a.admin, a.until)
     elif a.cmd == "passwd":
         err = set_password(a.name, ask_password())
+    elif a.cmd == "valid":
+        err = set_validity(a.name, a.until)
     elif a.cmd == "admin":
         err = set_admin(a.name, a.state == "on")
     else:
