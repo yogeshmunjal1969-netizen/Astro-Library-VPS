@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import zipfile
+from difflib import SequenceMatcher
 from collections import defaultdict, deque
 from email.utils import formatdate
 from http.cookies import SimpleCookie
@@ -53,6 +54,9 @@ CHUNK = 256 * 1024
 # shown in the browser; everything else (html, doc, epub…) is always sent as a download
 INLINE_TYPES = {"pdf": "application/pdf", "txt": "text/plain; charset=utf-8", "mp3": "audio/mpeg",
                 "mp4": "video/mp4", "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}
+# best-match ranking: how much a hit in each books_fts column counts (title, authors, publisher, topic, subtopic,
+# tags, language, tradition, doc_type, filename)
+FTS_WEIGHTS = "10.0, 4.0, 1.0, 2.0, 2.0, 2.0, 0.5, 1.0, 0.5, 3.0"
 EXPORTS = {"xlsx": "Astro Library Catalogue.xlsx", "csv": "Astro Library Catalogue.csv",
            "html": "Astro Library Catalogue.html"}
 
@@ -177,6 +181,7 @@ class Library:
         self.db_path = os.path.join(lib, "_library", "library.db")
         self.download = Job("download")
         self.task = Job("task")
+        self._vocab = (None, {}, {})                        # (catalogue mtime, term -> books, first letter -> terms)
 
     def db(self):
         if not os.path.exists(self.db_path):
@@ -245,7 +250,7 @@ class Library:
             db.execute("DELETE FROM web_shortlist WHERE user=?", (user,))
         ids = [int(i) for i in data.get("add") or []]
         if isinstance(data.get("add_query"), dict):          # every book matching the current search
-            w, params, _ = self.where(data["add_query"], user)
+            w, params, _, _ = self.where(data["add_query"], user, db)
             ids = [r[0] for r in db.execute(f"SELECT id FROM books {w}", params)]
         for i in ids:
             db.execute("INSERT OR IGNORE INTO web_shortlist SELECT ?, fileid, ? FROM books WHERE id=?", (user, now, i))
@@ -282,15 +287,62 @@ class Library:
         return [r[0] for r in db.execute(sql, params) if r[0] > 0]
 
     # --- search
-    def where(self, q, user):
-        """WHERE clause, params and ORDER BY for the filters in q (parse_qs output or a plain dict)."""
+    # --- search words: forgive misspellings by also searching close, much commoner words of the catalogue
+    def vocab(self, db):
+        mtime = os.path.getmtime(self.db_path)
+        if self._vocab[0] != mtime:
+            db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab USING fts5vocab(main, books_fts, row)")
+            terms = dict(db.execute("SELECT term, doc FROM temp.vocab"))
+            first = defaultdict(list)
+            for t in terms:
+                first[t[0]].append(t)
+            self._vocab = (mtime, terms, first)
+        return self._vocab[1], self._vocab[2]
+
+    def similar(self, db, word):
+        """Up to two common catalogue words spelled like `word`, when `word` itself is rare."""
+        terms, first = self.vocab(db)
+        hits = sum(n for t, n in terms.items() if t.startswith(word))
+        if len(word) < 4 or hits >= 20 or not word.isalpha():
+            return []
+        need = max(10, 5 * (hits + 1))
+        scored = []
+        for t in first.get(word[0], ()):
+            if terms[t] >= need and abs(len(t) - len(word)) <= 2 and not t.startswith(word):
+                ratio = SequenceMatcher(None, word, t).ratio()
+                if ratio >= 0.85:
+                    scored.append((ratio, terms[t], t))
+        return [t for _, _, t in sorted(scored, reverse=True)[:2]]
+
+    def fts_query(self, db, text):
+        """(FTS5 query, {typed word: [words also searched]}) - like AL.fts_query, plus spelling help."""
+        out, also = [], {}
+        for t in re.findall(r'"[^"]+"|\S+', text):
+            if t.startswith('"'):
+                out.append(t)
+                continue
+            t = re.sub(r'[^\w\u0080-\uFFFF-]', "", t)
+            if not t:
+                continue
+            alts = self.similar(db, t.lower())
+            if alts:
+                also[t] = alts
+                out.append("(" + " OR ".join(f'"{w}"*' for w in [t] + alts) + ")")
+            else:
+                out.append(f'"{t}"*')
+        return " AND ".join(out), also
+
+    def where(self, q, user, db=None):
+        """WHERE clause, params, ORDER BY and search details ({"fts": query or None, "also": spellings})
+        for the filters in q (parse_qs output or a plain dict)."""
         g = lambda k: (lambda v: str((v[0] if isinstance(v, list) else v) or ""))(q.get(k, "")).strip()
-        where, params = [], []
+        where, params, info = [], [], {"fts": None, "also": {}}
         if g("q"):
-            fq = AL.fts_query(g("q"))
+            fq, info["also"] = self.fts_query(db or self.db(), g("q"))
             if fq:
                 where.append("id IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)")
                 params.append(fq)
+                info["fts"] = fq
         for key, col in (("author", "authors"), ("publisher", "publisher"), ("title", "title")):
             if g(key):
                 where.append(f"{col} LIKE ?"); params.append(f"%{g(key)}%")
@@ -312,23 +364,30 @@ class Library:
         order = {"title": "title COLLATE NOCASE", "author": "authors IS NULL, authors COLLATE NOCASE",
                  "year": "year IS NULL, year", "year_desc": "year IS NULL, year DESC", "pages": "pages IS NULL, pages DESC",
                  "size": "size DESC", "added": "added DESC"}.get(g("sort"), "title COLLATE NOCASE")
+        if g("sort") in ("", "best") and info["fts"]:
+            order = "f.rank, title COLLATE NOCASE"            # needs the ranking join added by search()
         w = ("WHERE " + " AND ".join(where)) if where else ""
-        return w, params, order
+        return w, params, order, info
 
     def search(self, q, user):
         db = self.shortlist_db()
         if not self.has_catalogue(db):
             return {"total": 0, "rows": [], "error": "The catalogue has not been built yet."}
         g = lambda k: (q.get(k, [""])[0] or "").strip()
-        w, params, order = self.where(q, user)
         try:
+            w, params, order, info = self.where(q, user, db)
+            rank, rank_params = "", []
+            if order.startswith("f.rank"):
+                rank = (f"JOIN (SELECT rowid AS rid, bm25(books_fts, {FTS_WEIGHTS}) AS rank FROM books_fts "
+                        f"WHERE books_fts MATCH ?) f ON f.rid = books.id")
+                rank_params = [info["fts"]]
             total = db.execute(f"SELECT COUNT(*) FROM books {w}", params).fetchone()[0]
             page = max(0, int(g("page") or 0))
             rows = db.execute(f"SELECT id,title,authors,year,year_text,publisher,doc_type,tradition,language,tags,"
                               f"topic,subtopic,pages,size,ext,downloaded,local_path,"
                               f"fileid IN (SELECT fileid FROM web_shortlist WHERE user=?) AS short "
-                              f"FROM books {w} ORDER BY {order} LIMIT ? OFFSET ?",
-                              [user] + params + [PAGE_SIZE, page * PAGE_SIZE]).fetchall()
+                              f"FROM books {rank} {w} ORDER BY {order} LIMIT ? OFFSET ?",
+                              [user] + rank_params + params + [PAGE_SIZE, page * PAGE_SIZE]).fetchall()
         except (sqlite3.OperationalError, ValueError) as e:
             return {"total": 0, "rows": [], "error": f"Search error: {e}"}
         out = []
@@ -336,7 +395,8 @@ class Library:
             d = dict(r)
             d["fname"] = os.path.basename(d.pop("local_path") or "")
             out.append(d)
-        return {"total": total, "page_size": PAGE_SIZE, "rows": out, "shortlist": self.shortlist_summary(user, db)}
+        return {"total": total, "page_size": PAGE_SIZE, "rows": out, "also": info["also"],
+                "shortlist": self.shortlist_summary(user, db)}
 
     def book(self, bid, user):
         db = self.shortlist_db()
@@ -900,12 +960,12 @@ table.fl{border-collapse:collapse;font-size:12px;width:100%}table.fl td{border-b
   <div class="results">
    <div class="searchbar"><input id="q" placeholder="Search titles, authors, topics, publishers… (e.g. navamsa, &quot;medical astrology&quot;)" autofocus>
     <button class="b" id="ftog">Filters</button>
-    <select id="sort"><option value="title">Sort: Title</option><option value="author">Sort: Author</option><option value="year">Sort: Year ↑</option><option value="year_desc">Sort: Year ↓</option><option value="pages">Sort: Pages</option><option value="size">Sort: Size</option><option value="added">Sort: Recently added</option></select></div>
+    <select id="sort"><option value="best" title="Most relevant first when words are typed; by title otherwise">Sort: Best match</option><option value="title">Sort: Title</option><option value="author">Sort: Author</option><option value="year">Sort: Year ↑</option><option value="year_desc">Sort: Year ↓</option><option value="pages">Sort: Pages</option><option value="size">Sort: Size</option><option value="added">Sort: Recently added</option></select></div>
    <div class="sbar"><span>★ Shortlist: <b id="sl-count">0</b> book(s)<span id="sl-pend"></span></span>
     <button class="b" id="sl-view">View</button><a class="b p adm" id="sl-zip" href="/zip/shortlist" title="Download the shortlisted books as one ZIP file">Download ZIP</a>
     <button class="b adm" id="sl-dl" title="Fetch the shortlisted books that are not on the server yet from pCloud">Fetch from pCloud</button>
     <span class="sp"></span><button class="b danger" id="sl-clear">Clear</button></div>
-   <div class="meta"><span id="count"></span><a class="lnk" id="sl-addall" style="display:none">☆ Add all results to shortlist</a></div>
+   <div class="meta"><span id="count"></span><span id="also" style="color:var(--mute)"></span><a class="lnk" id="sl-addall" style="display:none">☆ Add all results to shortlist</a></div>
    <div class="list" id="list"></div>
    <div class="pager"><button class="b" id="prev">‹ Previous</button><span id="pg"></span><button class="b" id="next">Next ›</button></div>
   </div>
@@ -991,8 +1051,9 @@ async function loadFacets(){const f=await api('/api/facets');if(f.lib)$('dl-lib'
 function goTools(){document.querySelector('nav button[data-t=tools]').click()}
 function query(){const o={q:$('q').value,sort:$('sort').value};F.forEach(k=>o[k]=$('f-'+k).value);return o}
 async function search(){const p=new URLSearchParams({...query(),page});const r=await api('/api/search?'+p);
- if(r.error){$('list').innerHTML='<div class="empty">'+esc(r.error)+'</div>';$('count').textContent='';$('sl-addall').style.display='none';return}
- total=r.total;const ps=r.page_size;$('count').textContent=total.toLocaleString()+' result'+(total===1?'':'s');showShort(r.shortlist);
+ if(r.error){$('list').innerHTML='<div class="empty">'+esc(r.error)+'</div>';$('count').textContent=$('also').textContent='';$('sl-addall').style.display='none';return}
+ total=r.total;const ps=r.page_size;$('count').textContent=total.toLocaleString()+' result'+(total===1?'':'s');
+ const al=Object.entries(r.also||{});$('also').textContent=al.length?' · also searched '+al.map(([w,a])=>w+' → '+a.join(', ')).join('; '):'';showShort(r.shortlist);
  $('sl-addall').style.display=total&&$('f-avail').value!=='short'?'':'none';$('sl-addall').textContent='☆ Add '+(total===1?'this result':'all '+total.toLocaleString()+' results')+' to shortlist';
  $('pg').textContent='Page '+(page+1)+' of '+Math.max(1,Math.ceil(total/ps));$('prev').disabled=page===0;$('next').disabled=(page+1)*ps>=total;
  rows=new Map(r.rows.map(b=>[b.id,b]));
