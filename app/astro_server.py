@@ -19,11 +19,14 @@ manage user accounts.  Accounts are managed with astro_auth.py (or the Users car
 Uses only the Python standard library (plus the companion scripts in the same folder).
 """
 
+import faulthandler
+import http.client
 import json
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1181,19 +1184,67 @@ async function poll(){clearTimeout(poll.h);let busy=false;
 </script></body></html>"""
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+
+def sd_notify(msg):
+    """Tells systemd about the service (READY=1, WATCHDOG=1); does nothing when not run by systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(msg.encode(), addr)
+    except OSError:
+        pass
+
+
+def watchdog():
+    """While systemd's watchdog is on (WatchdogSec in astrobooks.service), asks this server for /healthz the way the
+    tunnel does and pings systemd only when it answers - so a server that stops answering is restarted (and,
+    with faulthandler on, first writes every thread's Python stack to the journal)."""
+    usec = int(os.environ.get("WATCHDOG_USEC") or 0)
+    if not usec or os.environ.get("WATCHDOG_PID", str(os.getpid())) != str(os.getpid()):
+        return
+    every = max(5.0, usec / 1e6 / 4)
+    host = "127.0.0.1" if BIND in ("", "0.0.0.0", "::") else BIND
+
+    def loop():
+        while True:
+            try:
+                c = http.client.HTTPConnection(host, PORT, timeout=10)
+                c.request("GET", "/healthz", headers={"Host": "localhost", "Connection": "close"})
+                r = c.getresponse()
+                r.read()                                         # closing with the reply unread resets the socket
+                if r.status == 200:
+                    sd_notify("WATCHDOG=1")
+                c.close()
+            except OSError as e:
+                sys.stderr.write(f"watchdog: health check failed: {e}\n")
+            time.sleep(every)
+
+    threading.Thread(target=loop, name="watchdog", daemon=True).start()
+
+
 def main():
+    faulthandler.enable(all_threads=True)                       # a crash or watchdog abort prints every stack
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     mimetypes.init()
     os.makedirs(LIB, exist_ok=True)
     AUTH.db()                                                   # create users.db early so permission problems show
     Handler.L = Library(LIB)
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    srv.daemon_threads = True
+    srv = Server((BIND, PORT), Handler)
     print(f"Astro Library server on http://{BIND}:{PORT}/   library: {LIB}   accounts: {AUTH.DATA_DIR}", flush=True)
     print(f"Answering for: {', '.join(sorted(ALLOWED_HOSTS))}", flush=True)
     if not AUTH.list_users():
         print("No user accounts yet - create one:  astrobooks user add NAME --admin", flush=True)
+    sd_notify("READY=1")
+    watchdog()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

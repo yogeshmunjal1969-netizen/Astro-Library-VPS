@@ -4,13 +4,18 @@ After=network-online.target local-fs.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+# the server pings systemd only while it answers its own /healthz; if it stops answering it is restarted
+# (WatchdogSignal=SIGABRT makes it write every thread's Python stack to the journal first)
+WatchdogSec=90
+WatchdogSignal=SIGABRT
 User=astrobooks
 Group=astrobooks
 EnvironmentFile=/etc/astrobooks/astrobooks.env
 WorkingDirectory=/opt/astrobooks/app
 ExecStart=/opt/astrobooks/venv/bin/python -u /opt/astrobooks/app/astro_server.py
-Restart=on-failure
+Restart=always
 RestartSec=5
 UMask=0022
 NoNewPrivileges=true
