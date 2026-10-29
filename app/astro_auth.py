@@ -28,6 +28,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 
 DATA_DIR = os.environ.get("ASTRO_DATA") or "/var/lib/astrobooks"
@@ -51,9 +52,33 @@ CREATE INDEX IF NOT EXISTS downloads_user_day ON downloads(user, day);
 """
 
 
+_opened = threading.local()
+
+
+def connect(path, timeout=30):
+    """sqlite3.connect that remembers the connection so close_opened() can close it. Python frees a sqlite3
+    connection only in a garbage-collection pass, so connections dropped without close() keep their files open
+    and a busy server runs out of file handles."""
+    con = sqlite3.connect(path, timeout=timeout)
+    if not hasattr(_opened, "cons"):
+        _opened.cons = []
+    _opened.cons.append(con)
+    return con
+
+
+def close_opened():
+    """Closes every connection this thread opened through connect() (the server calls it after each request)."""
+    for con in getattr(_opened, "cons", ()):
+        try:
+            con.close()
+        except sqlite3.Error:
+            pass
+    _opened.cons = []
+
+
 def db():
     os.makedirs(DATA_DIR, exist_ok=True)
-    con = sqlite3.connect(os.path.join(DATA_DIR, "users.db"), timeout=30)
+    con = connect(os.path.join(DATA_DIR, "users.db"))
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
     cols = {r[1] for r in con.execute("PRAGMA table_info(users)")}      # accounts made before these columns

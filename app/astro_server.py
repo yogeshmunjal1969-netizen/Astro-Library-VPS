@@ -189,7 +189,7 @@ class Library:
     def db(self):
         if not os.path.exists(self.db_path):
             return None
-        db = sqlite3.connect(self.db_path, timeout=30)
+        db = AUTH.connect(self.db_path)
         db.row_factory = sqlite3.Row
         return db
 
@@ -449,6 +449,12 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AstroLibrary"
     timeout = 120                       # a stalled client must not hold a reader's download slot for ever
     sys_version = ""
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        finally:
+            AUTH.close_opened()                          # each request's database connections, files freed now
 
     def log_message(self, fmt, *a):
         if os.environ.get("ASTRO_ACCESS_LOG"):
